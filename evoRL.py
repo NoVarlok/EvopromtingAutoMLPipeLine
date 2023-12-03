@@ -11,19 +11,33 @@ import os
 import random
 
 import numpy as np
+import pandas as pd
+import torch
 import openai
 
-openai.api_key = "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"
+from dataset import CSVDataset
+# from torch.utils.data import Dataset, DataLoader
+import torch.utils.data as data_utils
+import torch.nn.functional as F
+
+openai.api_key = "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"
 
 class EvoPrompting:
-    def __init__(self, lm, task, seed_folder, environment, T, m, k, n, p, alpha, 
-                 n_evaluations, target_model_size, target_episodes, seed_evaluation=False, evaluation_path=None):
+    def __init__(self, lm, task, seed_folder,
+                 train_dataset, test_dataset, metric_fn, loss_fn, device,
+                 T, m, k, n, p, alpha, n_evaluations,
+                 target_model_size, target_metric_score,
+                 seed_evaluation=False, evaluation_path=None):
         self.seed_folder = seed_folder # Folder where the seed codes are located
         self.seed_evaluation = seed_evaluation # Do we have to evaluate the seed codes?
         self.pre_evaluated_seed_metrics = self.load_pre_evaluated_seed_metrics(evaluation_path) # Pre evaluated seed metrics
         self.lm = lm # the crossover LM
         self.temperatures = [0.2, 0.6, 0.8, 1.0] # uniformly sample from these temperaturs
-        self.environment = environment # In our case CartPole-v1
+        self.train_dataset = train_dataset
+        self.test_datsaet = test_dataset
+        self.metric_fn = metric_fn
+        self.loss_fn = loss_fn
+        self.device = device
         self.T = T # Number of rounds
         self.m = m # number of few-shot prompts per round
         self.n = n # number of samples to generate per prompt,
@@ -34,7 +48,7 @@ class EvoPrompting:
         self.global_population = [] # Global historical Population
 
         self.target_model_size = target_model_size # Target model size of the few shot prompt
-        self.target_episodes = target_episodes # Target number of episodes of the few shot prompt
+        self.target_metric_score = target_metric_score # Target number of episodes of the few shot prompt
         
         # Set initial well designed architectures as parent models.
         # (Evaluate them useing the same eval function as used in the aalgo)
@@ -56,6 +70,7 @@ class EvoPrompting:
         # Initialize the population with seed architectures
         # List all the Python files in the seed folder
         seed_files = [f for f in os.listdir(self.seed_folder) if f.endswith('.py')]
+        # seed_files = ['simple_mlp_layer.py']
 
         for seed_file in seed_files:
             print("EVALUATING SEED: ", seed_file)
@@ -63,41 +78,41 @@ class EvoPrompting:
             seed_code = self.read_seed_files(seed_file_path)
 
             if self.seed_evaluation:
-                avg_episodes, model_size = self.eval_t(seed_code)
+                avg_metric, model_size = self.eval_t(seed_code)
             else:
                 json= self.pre_evaluated_seed_metrics[seed_file]
                 # convert string to float           
-                avg_episodes = float(json["avg_episodes"])
+                avg_metric = float(json["avg_metric"])
                 model_size = float(json["model_size"])
 
-            print("EVALUATED SEED: ", seed_file, "avg_episodes: ", avg_episodes, "model_size: ", model_size)
+            print("EVALUATED SEED: ", seed_file, "avg_metric: ", avg_metric, "model_size: ", model_size)
             metrics = {
-                "avg_episodes": avg_episodes,
+                "avg_metric": avg_metric,
                 "model_size": model_size,
             }
             
-            fitness_score = avg_episodes * model_size
+            fitness_score = avg_metric * model_size
             self.global_population.append((seed_code, metrics, fitness_score))
             self.current_population.append((seed_code, metrics, fitness_score))
         
 
     def make_few_shot_prompt(self, in_context_examples):
         # Create a few-shot prompt using the in context examples E
-        min_avg_episodes = float('inf')
+        min_avg_metric = float('inf')
         min_model_size = float('inf')
         prompt = "" # Initialize empty prompt string
 
         for example in in_context_examples:
             metrics = example[1]
-            min_avg_episodes = min(min_avg_episodes, metrics['avg_episodes']) # Retrieve the minium avg episodes of the parent architectures
+            min_avg_metric = min(min_avg_metric, metrics['avg_metric']) # Retrieve the minium avg metric of the parent architectures
             min_model_size = min(min_model_size, metrics['model_size']) # Retrieve the minium model size of the parent architectures
             prompt += f'\nMetrics: {example[1]}\n\n'
             prompt += f'Code: {example[0]}\n\n'
 
-        target_avg = min_avg_episodes * self.target_episodes
+        target_avg = min_avg_metric * self.target_metric_score
         target_model_size = min_model_size * self.target_model_size
 
-        prompt += f'\nmetrics: {{ "avg_episodes": {target_avg}, "model_size": {target_model_size} }}\n\n'
+        prompt += f'\nmetrics: {{ "avg_metric": {target_avg}, "model_size": {target_model_size} }}\n\n'
         prompt += f'Code:\n'
 
         return prompt
@@ -105,35 +120,39 @@ class EvoPrompting:
 
     def generate_child (self, prompt):
         child_code = openai.Completion.create(
-            model="gpt-4",
+            model="gpt-3.5-turbo-instruct",
             prompt=prompt,
             temperature=np.random.choice(self.temperatures, size=1, replace=True).item(),
             n=1,
             max_tokens = 1000,
         )
         #print("child code= ", child_code.choices[0].text)
+        # print(child_code.choices[0].text)
         return child_code.choices[0].text
-        
+
 
     def eval_t(self, code_segment):
         def single_evaluation():
-            print("Executing code segment")
-            exec(code_segment, globals())  # Add globals() here
-            episodes, model_size = globals()['main'](self.environment)
-            print(f"Finished executing code segment: episodes={episodes}, model_size={model_size}")
-            return episodes, model_size
+            try:
+                print("Executing code segment")
+                exec(code_segment, globals())  # Add globals() here
+                metric, model_size = globals()['main'](self.train_dataset, self.test_datsaet, self.metric_fn, self.loss_fn, self.device)
+                print(f"Finished executing code segment: metric={metric}, model_size={model_size}")
+                return metric, model_size
+            except Exception:
+                return np.inf, np.inf
 
-        sum_episodes = 0
+        sum_metric = 0
         with concurrent.futures.ThreadPoolExecutor() as executor:
             print("Submitting tasks to the thread pool")
             futures = [executor.submit(single_evaluation) for _ in range(self.n_evaluations)]
             for future in concurrent.futures.as_completed(futures):
-                episodes, model_size = future.result()
-                sum_episodes += episodes
+                metric, model_size = future.result()
+                sum_metric += metric
 
-        avg_episodes = sum_episodes / self.n_evaluations
-        print(f"Average episodes: {avg_episodes}, Model size: {model_size}")
-        return avg_episodes, model_size
+        avg_metric = sum_metric / self.n_evaluations
+        print(f"Average metric: {avg_metric}, Model size: {model_size}")
+        return avg_metric, model_size
 
 
     def get_top(self, global_population):
@@ -153,7 +172,9 @@ class EvoPrompting:
         list: A list containing the top num_top entries from the global_population based on their fitness
             scores.
         """
-        sorted_population = sorted(global_population, key=lambda x: x[2], reverse=True)
+        # sorted_population = sorted(global_population, key=lambda x: x[2], reverse=True)
+        sorted_population = sorted(global_population, key=lambda x: x[2], reverse=False)
+        print('Sorted Scores:', [x[2] for x in sorted_population])
         top_entries = sorted_population[:self.p]
         return top_entries
 
@@ -168,20 +189,21 @@ class EvoPrompting:
         return child_architectures
 
 
-    def fitness_function(self, model_size, n_episodes):
-        return model_size * n_episodes
+    def fitness_function(self, model_size, metric):
+        # return model_size * metric
+        return metric
 
 
-    def filter_and_eval(self, child_architectures, environment, alpha):
+    def filter_and_eval(self, child_architectures, alpha):
         CEVALED = []
         for code_segment in child_architectures:
-            avg_episodes, model_size = self.eval_t(code_segment)
-            if avg_episodes < alpha: # filter out the bad models
+            avg_metric, model_size = self.eval_t(code_segment)
+            if avg_metric < alpha: # filter out the bad models
                 metrics = {
-                    "avg_episodes": avg_episodes,
+                    "avg_metric": avg_metric,
                     "model_size": model_size,
                 }
-                fitness_score = self.fitness_function(model_size, avg_episodes)
+                fitness_score = self.fitness_function(model_size, avg_metric)
                 CEVALED.append((code_segment, metrics, fitness_score))
         return CEVALED
     
@@ -194,8 +216,11 @@ class EvoPrompting:
     def evolve(self):
         t = 0
         while t < self.T: # number of evoluationary rounds
+            print('=' * 50)
+            print('Evolution round:', t)
+            print('=' * 50)
             child_architectures = self.cross_mutation() # Generate the set of code samples
-            evaluated_children = self.filter_and_eval(child_architectures, self.environment, self.alpha)
+            evaluated_children = self.filter_and_eval(child_architectures, self.alpha)
             self.global_population.extend(evaluated_children)
 
             if t < self.T - 1:
@@ -206,29 +231,81 @@ class EvoPrompting:
             t += 1 
 
         return self.get_top(global_population=self.global_population)
+    
+    def save_results(self, directory):
+        top_k = self.get_top(global_population=self.global_population)
+        results = {
+            f'model_{i}': {
+                'metadata': data[1],
+                'fitness_score': data[2],
+            } for i, data in enumerate(top_k)
+        }
+        json_path = os.path.join(directory, 'results.json')
+        with open(json_path, 'w') as fout:
+            fout.write(json.dumps(results, indent=4))
+        for i, data in enumerate(top_k):
+            model_name = f'generated_model_{i}.py'
+            model_path = os.path.join(directory, model_name)
+            with open(model_path, 'w') as fout:
+                print(data[0], file=fout)
+
+
+def prepare_data_tensor(csv_path, target_name, batch_size):
+    train = pd.read_csv(csv_path)
+    train_target = torch.tensor(train[target_name].values.astype(np.float32))
+    train = torch.tensor(train.drop(target_name, axis = 1).values.astype(np.float32)) 
+    train_tensor = data_utils.TensorDataset(train, train_target) 
+    train_loader = data_utils.DataLoader(dataset = train_tensor, batch_size = batch_size, shuffle = True)
+    return train_loader
+
 
 if __name__ == "__main__":
     # Initialize the EvoPrompting class
     T = 10 # Number of rounds
-    m = 10 # number of few-shot prompts per round
-    n = 16 # number of samples to generate per prompt,
+    # m = 10 # number of few-shot prompts per round
+    # n = 16 # number of samples to generate per prompt,
+    m = 3 # number of few-shot prompts per round
+    n = 3 # number of samples to generate per prompt,
     k = 2 # number of in-context examples per prompt
-    p = 1 # number of survivors to select per generation
-    n_evaluations = 5 # Number of times to run each model
+    p = 5 # number of survivors to select per generation
+    # n_evaluations = 5 # Number of times to run each model
+    n_evaluations = 3
     alpha = 600000 # TBD (cutoff fitness for evaluated children)
+    # alpha = 2 # TBD (cutoff fitness for evaluated children)
     task = "create a solution that genreates the best model with the smallest paramter size"
     environment = "CartPole-v1" # environment of the task
     seed_folder = "seeds" # Folder which contains al the initial seed architectures
     lm = "text-davinci-003" # Language model to use for prompt generation
 
     target_model_factor = 0.90 
-    target_episodes = 0.95
+    target_metric = 0.95
 
-    evo_prompt = EvoPrompting(lm, task, seed_folder, environment, T, m, k, n, p, alpha,
-                              n_evaluations, target_model_factor, target_episodes, seed_evaluation=True,
-                              evaluation_path="seeds/pre_evaluated_seed_metrics.json")
+    target_name = 'Price'
+    dataset_name = 'housing_price_dataset'
+    train_csv_path = f'/home/lyakhtin/repos/hse/krylov2/PrepareDatasets/prepared_datasets/{dataset_name}/train.csv'
+    test_csv_path = f'/home/lyakhtin/repos/hse/krylov2/PrepareDatasets/prepared_datasets/{dataset_name}/test.csv'
+    save_directory = f'/home/lyakhtin/repos/hse/krylov2/Evopromt_models/{dataset_name}'
+
+    os.makedirs(save_directory, exist_ok=True)
+
+    batch_size = 1000
+    train_dataloader = prepare_data_tensor(train_csv_path, target_name, batch_size)
+    test_dataloader = prepare_data_tensor(test_csv_path, target_name, batch_size)
+
+    metric_fn = F.mse_loss
+    loss_fn = F.mse_loss
+    device = 'cuda:0'
+
+    evo_prompt = EvoPrompting(lm, task, seed_folder,
+                              train_dataloader, test_dataloader, metric_fn, loss_fn, device,
+                              T, m, k, n, p, alpha, n_evaluations,
+                              target_model_factor, target_metric, seed_evaluation=True,
+                              evaluation_path="seeds/pre_evaluated_seed_metrics_custom.json"
+                             )
     # Run the main evolutionary loop
     evo_prompt.evolve()
+    evo_prompt.save_results(save_directory)
+
 
     # evo_prompt.initialize_population()
     # print("evorpompt Global Population: ", evo_prompt.global_population)
