@@ -1,0 +1,15 @@
+{
+    "mlp.py": {
+      "avg_metric": -0.4035087823867798,
+      "model_size": 137483
+    },
+    "mlp_skip_connections.py": {
+      "avg_metric": -0.5350877046585083,
+      "model_size": 69003
+    },
+    "mlp_dropout.py": {
+      "avg_metric": -0.4035087823867798,
+      "model_size": 5643
+    }
+}
+  

@@ -9,17 +9,16 @@ import numpy as np
 from tqdm import tqdm
 
 
-INPUT_SIZE = 7
-OUTPUT_SIZE = 1
+INPUT_SIZE = 11
+OUTPUT_SIZE = 11
 SEED = 0
 
 #Hyperparameters
-learning_rate = 1e-2
+learning_rate = 1e-3
 epochs = 10
-hidded_layer = 128
-layers_count = 3
-act_fn = F.relu
-dropout_rate = 0.05
+hidded_layer = 256
+layers_count = 4
+act_fn = F.sigmoid
 
 
 random.seed(SEED)
@@ -46,8 +45,9 @@ class Model(nn.Module):
 
     def forward(self, X):
         for i in range(self.layers_count - 1):
-            X = act_fn(F.dropout(self.layers[i](X), dropout_rate))
+            X = act_fn(self.layers[i](X))
         X = self.layers[-1](X)
+        X = F.softmax(X, dim=1)
         return X
 
 
@@ -57,12 +57,12 @@ def main(train_dataset, test_dataset, metric_fn, loss_fn, device):
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     metric = 0
-    batch_count = 0
+    samples_count = 0
 
     for epoch in range(epochs):
         for X, y in train_dataset:
             X = X.to(device)
-            y = torch.unsqueeze(y, 1).to(device)
+            y = y.to(device)
             optimizer.zero_grad()
             output = model(X)
             loss = loss_fn(output, y)
@@ -72,11 +72,12 @@ def main(train_dataset, test_dataset, metric_fn, loss_fn, device):
     with torch.no_grad():
         for X, y in test_dataset:
             X = X.to(device)
-            y = torch.unsqueeze(y, 1).to(device)
+            y = y.to(device)
             output = model(X)
-            metric += metric_fn(y, output)
-            batch_count += 1
+            predicted_classes = torch.argmax(output, dim=1)
+            metric += metric_fn(y, predicted_classes)
+            samples_count += len(y)
 
-    metric /= batch_count
+    metric = metric / samples_count
 
-    return float(metric), int(model_paramters_count)
+    return -float(metric), int(model_paramters_count)

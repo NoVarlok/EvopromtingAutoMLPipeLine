@@ -13,14 +13,17 @@ import random
 import numpy as np
 import pandas as pd
 import torch
-import openai
+from openai import OpenAI
 
 from dataset import CSVDataset
 # from torch.utils.data import Dataset, DataLoader
 import torch.utils.data as data_utils
 import torch.nn.functional as F
 
-openai.api_key = "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"
+
+client = OpenAI(api_key="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")
+MODEL_NAME = "gpt-3.5-turbo-1106"
+
 
 class EvoPrompting:
     def __init__(self, lm, task, seed_folder,
@@ -91,7 +94,8 @@ class EvoPrompting:
                 "model_size": model_size,
             }
             
-            fitness_score = avg_metric * model_size
+            # fitness_score = avg_metric * model_size
+            fitness_score = self.fitness_function(model_size, avg_metric)
             self.global_population.append((seed_code, metrics, fitness_score))
             self.current_population.append((seed_code, metrics, fitness_score))
         
@@ -113,22 +117,23 @@ class EvoPrompting:
         target_model_size = min_model_size * self.target_model_size
 
         prompt += f'\nmetrics: {{ "avg_metric": {target_avg}, "model_size": {target_model_size} }}\n\n'
-        prompt += f'Code:\n'
+        # prompt += f'Code:\n'
+        prompt += f'Provide code, that mix models and reaches the target metrics. Do not use ellipsis library\nCode:'
+        # print(prompt)
 
         return prompt
 
 
     def generate_child (self, prompt):
-        child_code = openai.Completion.create(
-            model="gpt-3.5-turbo-instruct",
-            prompt=prompt,
+        child_code = client.chat.completions.create(
+            # model="gpt-3.5-turbo-1106",
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
             temperature=np.random.choice(self.temperatures, size=1, replace=True).item(),
             n=1,
-            max_tokens = 1000,
+            max_tokens = 1000
         )
-        #print("child code= ", child_code.choices[0].text)
-        # print(child_code.choices[0].text)
-        return child_code.choices[0].text
+        return child_code.choices[0].message.content
 
 
     def eval_t(self, code_segment):
@@ -139,7 +144,9 @@ class EvoPrompting:
                 metric, model_size = globals()['main'](self.train_dataset, self.test_datsaet, self.metric_fn, self.loss_fn, self.device)
                 print(f"Finished executing code segment: metric={metric}, model_size={model_size}")
                 return metric, model_size
-            except Exception:
+            except Exception as e:
+                # print(code_segment)
+                print('Exception:', e)
                 return np.inf, np.inf
 
         sum_metric = 0
@@ -198,7 +205,8 @@ class EvoPrompting:
         CEVALED = []
         for code_segment in child_architectures:
             avg_metric, model_size = self.eval_t(code_segment)
-            if avg_metric < alpha: # filter out the bad models
+            # if avg_metric < alpha: # filter out the bad models
+            if True:
                 metrics = {
                     "avg_metric": avg_metric,
                     "model_size": model_size,
@@ -225,6 +233,7 @@ class EvoPrompting:
 
             if t < self.T - 1:
                 self.current_population = self.get_top(global_population=self.global_population)
+                self.global_population = self.current_population
                 #run without training
                 #self.lm = self.train(self.lm, [c for c, _ in evaluated_children if c not in self.current_population])
             
@@ -250,9 +259,9 @@ class EvoPrompting:
                 print(data[0], file=fout)
 
 
-def prepare_data_tensor(csv_path, target_name, batch_size):
+def prepare_data_tensor(csv_path, target_name, batch_size, target_type):
     train = pd.read_csv(csv_path)
-    train_target = torch.tensor(train[target_name].values.astype(np.float32))
+    train_target = torch.tensor(train[target_name].values.astype(target_type))
     train = torch.tensor(train.drop(target_name, axis = 1).values.astype(np.float32)) 
     train_tensor = data_utils.TensorDataset(train, train_target) 
     train_loader = data_utils.DataLoader(dataset = train_tensor, batch_size = batch_size, shuffle = True)
@@ -260,8 +269,9 @@ def prepare_data_tensor(csv_path, target_name, batch_size):
 
 
 if __name__ == "__main__":
+    dataset_type = 'classification'
     # Initialize the EvoPrompting class
-    T = 10 # Number of rounds
+    T = 3 # Number of rounds
     # m = 10 # number of few-shot prompts per round
     # n = 16 # number of samples to generate per prompt,
     m = 3 # number of few-shot prompts per round
@@ -274,33 +284,41 @@ if __name__ == "__main__":
     # alpha = 2 # TBD (cutoff fitness for evaluated children)
     task = "create a solution that genreates the best model with the smallest paramter size"
     environment = "CartPole-v1" # environment of the task
-    seed_folder = "seeds" # Folder which contains al the initial seed architectures
     lm = "text-davinci-003" # Language model to use for prompt generation
 
     target_model_factor = 0.90 
     target_metric = 0.95
 
-    target_name = 'Price'
-    dataset_name = 'housing_price_dataset'
+    # target_name = 'Price'
+    # dataset_name = 'housing_price_dataset'
+    target_name = 'quality'
+    dataset_name = 'WineQT'
     train_csv_path = f'/home/lyakhtin/repos/hse/krylov2/PrepareDatasets/prepared_datasets/{dataset_name}/train.csv'
     test_csv_path = f'/home/lyakhtin/repos/hse/krylov2/PrepareDatasets/prepared_datasets/{dataset_name}/test.csv'
-    save_directory = f'/home/lyakhtin/repos/hse/krylov2/Evopromt_models/{dataset_name}'
+    # save_directory = f'/home/lyakhtin/repos/hse/krylov2/Evopromt_models/{dataset_name}_gpt-3.5-turbo'
+    save_directory = f'/home/lyakhtin/repos/hse/krylov2/Evopromt_models/{dataset_name}_{MODEL_NAME}'
 
     os.makedirs(save_directory, exist_ok=True)
 
     batch_size = 1000
-    train_dataloader = prepare_data_tensor(train_csv_path, target_name, batch_size)
-    test_dataloader = prepare_data_tensor(test_csv_path, target_name, batch_size)
+    target_type = np.int64 if dataset_type == 'classification' else np.float32
+    train_dataloader = prepare_data_tensor(train_csv_path, target_name, batch_size, target_type)
+    test_dataloader = prepare_data_tensor(test_csv_path, target_name, batch_size, target_type)
 
-    metric_fn = F.mse_loss
-    loss_fn = F.mse_loss
+    if dataset_type == 'classification':
+        metric_fn = lambda y_true, y_predicted: (y_true == y_predicted).sum()
+        loss_fn = F.cross_entropy
+    else:
+        metric_fn = F.mse_loss
+        loss_fn = F.mse_loss
     device = 'cuda:0'
 
+    seed_folder = f'seeds/{dataset_name}' # Folder which contains al the initial seed architectures
     evo_prompt = EvoPrompting(lm, task, seed_folder,
                               train_dataloader, test_dataloader, metric_fn, loss_fn, device,
                               T, m, k, n, p, alpha, n_evaluations,
                               target_model_factor, target_metric, seed_evaluation=True,
-                              evaluation_path="seeds/pre_evaluated_seed_metrics_custom.json"
+                              evaluation_path=f"seeds/{dataset_name}/pre_evaluated_seed_metrics_custom.json",
                              )
     # Run the main evolutionary loop
     evo_prompt.evolve()
