@@ -9,33 +9,29 @@ import concurrent.futures
 import json
 import os
 import random
+import argparse
 
 import numpy as np
 import pandas as pd
 import torch
-from openai import OpenAI
-
-from dataset import CSVDataset
 import torch.utils.data as data_utils
 import torch.nn.functional as F
 
+from openai import OpenAI
 
-client = OpenAI(api_key="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")
-# MODEL_NAME = "gpt-3.5-turbo-1106"
-# MODEL_NAME = "gpt-4-1106-preview"
-MODEL_NAME = "gpt-4"
-
+from utils import Config, load_config
 
 class EvoPrompting:
-    def __init__(self, lm, task, seed_folder,
+    def __init__(self, seed_folder,
                  train_dataset, test_dataset, metric_fn, loss_fn, device,
                  T, m, k, n, p, alpha, n_evaluations,
-                 target_model_size, target_metric_score,
+                 target_model_size, target_metric_score, task,
+                 openai_model, openai_token,
+                 incorrect_models_dir,
                  seed_evaluation=False, evaluation_path=None):
         self.seed_folder = seed_folder # Folder where the seed codes are located
         self.seed_evaluation = seed_evaluation # Do we have to evaluate the seed codes?
         self.pre_evaluated_seed_metrics = self.load_pre_evaluated_seed_metrics(evaluation_path) # Pre evaluated seed metrics
-        self.lm = lm # the crossover LM
         self.temperatures = [0.2, 0.6, 0.8, 1.0] # uniformly sample from these temperaturs
         self.train_dataset = train_dataset
         self.test_datsaet = test_dataset
@@ -53,12 +49,16 @@ class EvoPrompting:
 
         self.target_model_size = target_model_size # Target model size of the few shot prompt
         self.target_metric_score = target_metric_score # Target number of episodes of the few shot prompt
+        self.task = task
+
+        self.openai_model = openai_model
+        self.client = OpenAI(api_key=openai_token)
         
         # Set initial well designed architectures as parent models.
         # (Evaluate them useing the same eval function as used in the aalgo)
         self.current_population = []
         self.training_code = self.read_seed_files(os.path.join(self.seed_folder, 'main.py'))
-        self.incorrect_models_dir = '/home/lyakhtin/repos/hse/krylov2/PrepareDatasets/incorrect_models'
+        self.incorrect_models_dir = incorrect_models_dir
         self.initialize_population()
     
 
@@ -128,9 +128,9 @@ class EvoPrompting:
 
 
     def generate_child (self, prompt):
-        child_code = client.chat.completions.create(
+        child_code = self.client.chat.completions.create(
             # model="gpt-3.5-turbo-1106",
-            model=MODEL_NAME,
+            model=self.openai_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=np.random.choice(self.temperatures, size=1, replace=True).item(),
             n=1,
@@ -144,13 +144,11 @@ class EvoPrompting:
             try:
                 print("Executing code segment")
                 training_code_segment = code_segment + '\n\n' + self.training_code + '\n'
-                # print(training_code_segment)
                 exec(training_code_segment, globals())  # Add globals() here
                 metric, model_size = globals()['main'](self.train_dataset, self.test_datsaet, self.metric_fn, self.loss_fn, self.device)
                 print(f"Finished executing code segment: metric={metric}, model_size={model_size}")
                 return metric, model_size
             except Exception as e:
-                # print(code_segment)
                 print('Exception:', e)
                 filename = f'{len(os.listdir(self.incorrect_models_dir))}.py'
                 with open(os.path.join(self.incorrect_models_dir, filename), 'w') as f:
@@ -187,7 +185,6 @@ class EvoPrompting:
         list: A list containing the top num_top entries from the global_population based on their fitness
             scores.
         """
-        # sorted_population = sorted(global_population, key=lambda x: x[2], reverse=True)
         sorted_population = sorted(global_population, key=lambda x: x[2], reverse=False)
         print('Sorted Scores:', [x[2] for x in sorted_population])
         top_entries = sorted_population[:self.p]
@@ -205,8 +202,14 @@ class EvoPrompting:
 
 
     def fitness_function(self, model_size, metric):
-        # return model_size * metric
-        return metric
+        if np.isinf(metric):
+            return np.inf
+        if self.task == "classification":
+            target_metric = 1 - metric
+        else:
+            target_metric = metric
+        sigmoid = lambda x: 1/(1 + np.exp(-x))
+        return sigmoid(model_size) * target_metric
 
 
     def filter_and_eval(self, child_architectures, alpha):
@@ -277,66 +280,36 @@ def prepare_data_tensor(csv_path, target_name, batch_size, target_type):
 
 
 if __name__ == "__main__":
-    # dataset_type = 'classification'
-    dataset_type = 'regression'
+    parser = argparse.ArgumentParser(description='Process some integers.')
+    parser.add_argument('--config-path', type=str, required=True, help='Path to config')
+    args = parser.parse_args()
+    
+    config = load_config(args.config_path)
 
-    # Initialize the EvoPrompting class
-    T = 3 # Number of rounds
-    # m = 10 # number of few-shot prompts per round
-    # n = 16 # number of samples to generate per prompt,
-    m = 3 # number of few-shot prompts per round
-    n = 3 # number of samples to generate per prompt,
-    k = 2 # number of in-context examples per prompt
-    p = 5 # number of survivors to select per generation
-    # n_evaluations = 5 # Number of times to run each model
-    n_evaluations = 3
-    alpha = 600000 # TBD (cutoff fitness for evaluated children)
-    # alpha = 2 # TBD (cutoff fitness for evaluated children)
-    task = "create a solution that genreates the best model with the smallest paramter size"
-    environment = "CartPole-v1" # environment of the task
-    lm = "text-davinci-003" # Language model to use for prompt generation
+    os.makedirs(config.save_directory, exist_ok=True)
+    os.makedirs(config.incorrect_models_dir, exist_ok=True)
 
-    target_model_factor = 0.90 
-    target_metric = 0.95
+    target_type = np.int64 if config.dataset_type == 'classification' else np.float32
+    train_dataloader = prepare_data_tensor(config.train_dataset_path, config.target_name, config.batch_size, target_type)
+    test_dataloader = prepare_data_tensor(config.test_dataset_path, config.target_name, config.batch_size, target_type)
 
-    target_name = 'Price'
-    dataset_name = 'housing_price_dataset'
-    # target_name = 'quality'
-    # dataset_name = 'WineQT'
-    train_csv_path = f'/home/lyakhtin/repos/hse/krylov2/PrepareDatasets/prepared_datasets/{dataset_name}/train.csv'
-    test_csv_path = f'/home/lyakhtin/repos/hse/krylov2/PrepareDatasets/prepared_datasets/{dataset_name}/test.csv'
-    # save_directory = f'/home/lyakhtin/repos/hse/krylov2/Evopromt_models/{dataset_name}_gpt-3.5-turbo'
-    save_directory = f'/home/lyakhtin/repos/hse/krylov2/Evopromt_models/{dataset_name}_{MODEL_NAME}'
-
-    os.makedirs(save_directory, exist_ok=True)
-
-    batch_size = 1000
-    target_type = np.int64 if dataset_type == 'classification' else np.float32
-    train_dataloader = prepare_data_tensor(train_csv_path, target_name, batch_size, target_type)
-    test_dataloader = prepare_data_tensor(test_csv_path, target_name, batch_size, target_type)
-
-    if dataset_type == 'classification':
+    if config.dataset_type == 'classification':
         metric_fn = lambda y_true, y_predicted: (y_true == y_predicted).sum()
         loss_fn = F.cross_entropy
     else:
         metric_fn = F.mse_loss
         loss_fn = F.mse_loss
-    device = 'cuda:0'
 
-    seed_folder = f'seeds/{dataset_name}' # Folder which contains al the initial seed architectures
-    evo_prompt = EvoPrompting(lm, task, seed_folder,
-                              train_dataloader, test_dataloader, metric_fn, loss_fn, device,
-                              T, m, k, n, p, alpha, n_evaluations,
-                              target_model_factor, target_metric, seed_evaluation=True,
-                              evaluation_path=f"seeds/{dataset_name}/pre_evaluated_seed_metrics_custom.json",
+    evo_prompt = EvoPrompting(config.seed_folder,
+                              train_dataloader, test_dataloader, metric_fn, loss_fn, config.device,
+                              config.rounds_count, config.few_shot_prompts_per_round,
+                              config.in_context_examples_per_prompt, config.samples_per_prompt,
+                              config.survivors_per_generation, config.alpha, config.n_evaluations,
+                              config.target_model_factor, config.target_metric, config.dataset_type,
+                              config.openai_model_name, config.openai_token, config.incorrect_models_dir,
+                              seed_evaluation=True,
+                              evaluation_path=os.path.join(config.seed_folder, "pre_evaluated_seed_metrics_custom.json")
                              )
     # Run the main evolutionary loop
     evo_prompt.evolve()
-    evo_prompt.save_results(save_directory)
-
-
-    # evo_prompt.initialize_population()
-    # print("evorpompt Global Population: ", evo_prompt.global_population)
-
-    # top = evo_prompt.get_top(global_population = evo_prompt.global_population)
-    # print('top', top)
+    evo_prompt.save_results(config.save_directory)

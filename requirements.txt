@@ -1,0 +1,9 @@
+be-great
+huggingface-hub
+numpy
+networkx
+openai
+pandas
+PyYAML
+scikit-learn
+scipy
