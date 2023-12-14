@@ -16,13 +16,14 @@ import torch
 from openai import OpenAI
 
 from dataset import CSVDataset
-# from torch.utils.data import Dataset, DataLoader
 import torch.utils.data as data_utils
 import torch.nn.functional as F
 
 
 client = OpenAI(api_key="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")
-MODEL_NAME = "gpt-3.5-turbo-1106"
+# MODEL_NAME = "gpt-3.5-turbo-1106"
+# MODEL_NAME = "gpt-4-1106-preview"
+MODEL_NAME = "gpt-4"
 
 
 class EvoPrompting:
@@ -56,6 +57,8 @@ class EvoPrompting:
         # Set initial well designed architectures as parent models.
         # (Evaluate them useing the same eval function as used in the aalgo)
         self.current_population = []
+        self.training_code = self.read_seed_files(os.path.join(self.seed_folder, 'main.py'))
+        self.incorrect_models_dir = '/home/lyakhtin/repos/hse/krylov2/PrepareDatasets/incorrect_models'
         self.initialize_population()
     
 
@@ -72,7 +75,7 @@ class EvoPrompting:
     def initialize_population(self):
         # Initialize the population with seed architectures
         # List all the Python files in the seed folder
-        seed_files = [f for f in os.listdir(self.seed_folder) if f.endswith('.py')]
+        seed_files = [f for f in os.listdir(self.seed_folder) if f.endswith('.py') and f != 'main.py']
         # seed_files = ['simple_mlp_layer.py']
 
         for seed_file in seed_files:
@@ -118,7 +121,7 @@ class EvoPrompting:
 
         prompt += f'\nmetrics: {{ "avg_metric": {target_avg}, "model_size": {target_model_size} }}\n\n'
         # prompt += f'Code:\n'
-        prompt += f'Provide code, that mix models and reaches the target metrics. Do not use ellipsis library\nCode:'
+        prompt += f'Generate model architecture based on mutation of these models, that reachers better metrics value. Do not generate training code\nCode:'
         # print(prompt)
 
         return prompt
@@ -140,13 +143,18 @@ class EvoPrompting:
         def single_evaluation():
             try:
                 print("Executing code segment")
-                exec(code_segment, globals())  # Add globals() here
+                training_code_segment = code_segment + '\n\n' + self.training_code + '\n'
+                # print(training_code_segment)
+                exec(training_code_segment, globals())  # Add globals() here
                 metric, model_size = globals()['main'](self.train_dataset, self.test_datsaet, self.metric_fn, self.loss_fn, self.device)
                 print(f"Finished executing code segment: metric={metric}, model_size={model_size}")
                 return metric, model_size
             except Exception as e:
                 # print(code_segment)
                 print('Exception:', e)
+                filename = f'{len(os.listdir(self.incorrect_models_dir))}.py'
+                with open(os.path.join(self.incorrect_models_dir, filename), 'w') as f:
+                    print(code_segment, file=f)
                 return np.inf, np.inf
 
         sum_metric = 0
@@ -269,7 +277,9 @@ def prepare_data_tensor(csv_path, target_name, batch_size, target_type):
 
 
 if __name__ == "__main__":
-    dataset_type = 'classification'
+    # dataset_type = 'classification'
+    dataset_type = 'regression'
+
     # Initialize the EvoPrompting class
     T = 3 # Number of rounds
     # m = 10 # number of few-shot prompts per round
@@ -289,10 +299,10 @@ if __name__ == "__main__":
     target_model_factor = 0.90 
     target_metric = 0.95
 
-    # target_name = 'Price'
-    # dataset_name = 'housing_price_dataset'
-    target_name = 'quality'
-    dataset_name = 'WineQT'
+    target_name = 'Price'
+    dataset_name = 'housing_price_dataset'
+    # target_name = 'quality'
+    # dataset_name = 'WineQT'
     train_csv_path = f'/home/lyakhtin/repos/hse/krylov2/PrepareDatasets/prepared_datasets/{dataset_name}/train.csv'
     test_csv_path = f'/home/lyakhtin/repos/hse/krylov2/PrepareDatasets/prepared_datasets/{dataset_name}/test.csv'
     # save_directory = f'/home/lyakhtin/repos/hse/krylov2/Evopromt_models/{dataset_name}_gpt-3.5-turbo'
